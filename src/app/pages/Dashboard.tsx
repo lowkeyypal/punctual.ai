@@ -137,7 +137,7 @@ export function Dashboard() {
 
   const handleExcuseAction = async (employeeId: string, action: 'APPROVED' | 'REJECTED' | 'PENDING') => {
     try {
-      const response = await fetch('http://localhost:5678/webhook/hr-override', {
+      const response = await fetch(`${import.meta.env.VITE_N8N_BASE_URL}/webhook/hr-override`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

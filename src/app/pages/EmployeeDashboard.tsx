@@ -116,7 +116,7 @@ export function EmployeeDashboard() {
     setSubmitting(true);
 
     try {
-      await fetch('http://localhost:5678/webhook/excuse-appeal', {
+      await fetch(`${import.meta.env.VITE_N8N_BASE_URL}/webhook/excuse-appeal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
