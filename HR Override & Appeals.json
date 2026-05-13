@@ -1,0 +1,236 @@
+{
+  "name": "HR Override & Appeals",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hr-override",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "38536c7d-04a8-4000-8699-a018b86091be",
+      "name": "Webhook",
+      "webhookId": "2d7dfc8b-c407-40aa-b6fb-e65163704e96"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE strike_counter \nSET excused = '{{ $json.body.action }}'\nWHERE employee_id = '{{ $json.body.employeeId }}';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        0
+      ],
+      "id": "e4f6190b-0122-4cf4-be7a-c4d2dbaba591",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, description, employee_id, action_by)\nVALUES (\n  'EXCUSE_OVERRIDE',\n  'HR manually {{ $json.body.action }} excuse for employee',\n  '{{ $json.body.employeeId }}',\n  '{{ $json.body.hrManager }}'\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        448,
+        0
+      ],
+      "id": "6b056d33-f668-4880-b9ee-2bad0634dbb5",
+      "name": "Audit Log",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"success\"}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        672,
+        0
+      ],
+      "id": "54ca0d6c-a14d-49dc-940e-fcf22edfbb6d",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "excuse-appeal",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        224
+      ],
+      "id": "97ca05bc-f14c-40b1-99bb-ef6579628637",
+      "name": "Webhook1",
+      "webhookId": "54eefb2d-c2c2-4ea5-8276-165307406ed9"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE strike_counter \nSET excused = 'PENDING',\nexcuse_provided = '{{ $json.body.reason }}'\nWHERE employee_id = '{{ $json.body.employeeId }}';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        224
+      ],
+      "id": "c764226a-b4f5-42fc-ab95-ece49facd756",
+      "name": "Execute a SQL query1",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, description, employee_id, action_by)\nVALUES (\n  'APPEAL_SUBMITTED',\n  'Employee submitted excuse appeal: {{ $json.body.reason }}',\n  '{{ $json.body.employeeId }}',\n  '{{ $json.body.email }}'\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        448,
+        224
+      ],
+      "id": "9901f990-c248-4f75-965c-e0632d6af428",
+      "name": "Audit Log 2",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"success\"}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        672,
+        224
+      ],
+      "id": "c53e785b-f045-4d1f-b8f0-cc6a48184fbe",
+      "name": "Respond to Webhook1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Log": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query1": {
+      "main": [
+        [
+          {
+            "node": "Audit Log 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Log 2": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "da053461-2166-42b9-8048-456f2887c8fc",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "4acd8bf51771f6f4fa0ffda7ef1f0835417d4e00e0e146418b542b6b81dbbc05"
+  },
+  "id": "NYb2uIKpnHobq4xN",
+  "tags": []
+}

@@ -1,0 +1,1143 @@
+{
+  "name": "Attendance System",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT employee_id, name, month_year, monthly_late_count\nFROM strike_counter\nWHERE employee_id = '{{ $json.employee_id }}'\nORDER BY month_year ASC;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        672,
+        -272
+      ],
+      "id": "82b81d84-3815-4f33-bd39-33e1e5fd4d16",
+      "name": "Fetch Employee History",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "llama3.2:3b",
+          "mode": "list",
+          "cachedResultName": "llama3.2:3b"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are an HR analyst. Analyze this employee's late attendance pattern and be concise.\n\nEmployee: {{ $json.name }} ({{ $json.employee_id }})\nMonthly History:\n{{ $json.historyText }}\n\nAnswer these 3 points in exactly 3 short sentences:\n1. Is the pattern improving, worsening or consistent?\n2. Any specific months that stand out?\n3. Risk level: Low / Medium / High and why?\n\nReturn ONLY the 3 sentences, no headers, no bullet points."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.ollama",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        -272
+      ],
+      "id": "99fd8b69-8890-429c-85ef-e17c5daceede",
+      "name": "Analyse Behaviour",
+      "credentials": {
+        "ollamaApi": {
+          "id": "E654q1G75D7HVMYV",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "attendance",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -896,
+        -560
+      ],
+      "id": "7401fe62-9699-4540-b4c9-31ee36332d01",
+      "name": "Receive Attendance File",
+      "webhookId": "2e798797-d357-4048-a786-96e2b02bfe93"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "DELETE FROM daily_records;\nDELETE FROM strike_counter;\nDELETE FROM audit_log;\nDELETE FROM leave_balances;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -672,
+        -752
+      ],
+      "id": "d9db5c6c-8964-482d-9453-1d3e75ec8d75",
+      "name": "Clear Old Records",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -672,
+        -464
+      ],
+      "id": "a2ea90f1-5645-4b78-9645-03053141e181",
+      "name": "Parse XLSX"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────\n// Transform Attendance Data\n//\n// For present days  → late_flag = 'NO' or 'YES' based on check-in time\n// For absent ('A') days → deterministically assign SL/CL/EL per date\n//   so the calendar shows actual leave type badges on exact dates.\n//   Same empId+date always produces the same leave type (stable across re-runs).\n// OFF rows (weekend/holiday) are skipped entirely.\n// ─────────────────────────────────────────────────────────────────\n\nconst items = $input.all();\nconst results = [];\nlet currentEmployee = null;\n\nlet colMap = {\n  dateOfJoining: '__EMPTY_1',\n  managerNo: '__EMPTY_2',\n  managerName: '__EMPTY_3',\n  department: '__EMPTY_5',\n  designation: '__EMPTY_6'\n};\n\nfunction excelDateToString(val) {\n  if (!val) return String(val);\n  if (typeof val === 'string' && val.includes('-')) return val.trim();\n  const serial = Number(val);\n  if (isNaN(serial)) return String(val).trim();\n  const date = new Date((serial - 25569) * 86400 * 1000);\n  return date.toISOString().split('T')[0];\n}\n\nfunction extractTime(str) {\n  if (!str || str.trim() === '') return 'MISSING';\n  const s = String(str).trim();\n  const match = s.match(/(\\d{1,2})\\s*:\\s*(\\d{2})/);\n  if (match) return `${match[1].padStart(2,'0')}:${match[2]}`;\n  const num = Number(s);\n  if (!isNaN(num) && num > 0 && num < 1) {\n    const totalMinutes = Math.round(num * 24 * 60);\n    return `${String(Math.floor(totalMinutes/60)).padStart(2,'0')}:${String(totalMinutes%60).padStart(2,'0')}`;\n  }\n  return 'MISSING';\n}\n\n// Deterministic: same empId+date always returns the same leave type\nfunction assignLeaveType(empId, dateStr) {\n  const seed = [...(empId + dateStr)].reduce((acc, c) => acc + c.charCodeAt(0), 0);\n  return ['SL', 'CL', 'EL'][seed % 3];\n}\n\nfor (const item of items) {\n  const row = item.json;\n  const firstCol = row['Growify Digital LLP'];\n  const firstStr = String(firstCol || '').trim();\n\n  // Dynamic header detection\n  if (firstStr.toLowerCase().includes('employee') && firstStr.toLowerCase().includes('no')) {\n    for (const key of Object.keys(row)) {\n      const val = String(row[key] || '').trim().toLowerCase();\n      if (val.includes('date of joining')) colMap.dateOfJoining = key;\n      if (val.includes('manager no')) colMap.managerNo = key;\n      if (val.includes('manager name')) colMap.managerName = key;\n      if (val === 'department') colMap.department = key;\n      if (val === 'designation') colMap.designation = key;\n    }\n    continue;\n  }\n\n  // Employee header row\n  if (firstStr.match(/^GD\\d+/)) {\n    currentEmployee = {\n      employeeId: firstStr,\n      name: String(row['__EMPTY'] || '').trim(),\n      dateOfJoining: excelDateToString(row[colMap.dateOfJoining]),\n      managerNo: String(row[colMap.managerNo] || 'Unknown').trim(),\n      managerName: String(row[colMap.managerName] || 'Unknown').trim(),\n      department: String(row[colMap.department] || 'Unknown').trim(),\n      designation: String(row[colMap.designation] || 'Unknown').trim()\n    };\n    continue;\n  }\n\n  if (!currentEmployee) continue;\n  if (!firstCol || isNaN(Number(firstCol))) continue;\n\n  const dateRaw  = row['__EMPTY'];\n  const session1 = String(row['__EMPTY_1'] || '').trim().toUpperCase();\n  const inTime   = String(row['__EMPTY_3'] || '').trim();\n  const outTime  = String(row['__EMPTY_4'] || '').trim();\n  const dateStr  = excelDateToString(dateRaw);\n  if (!dateStr || dateStr === 'undefined') continue;\n\n  const dateObj = new Date(dateStr);\n  const isWeekend = dateObj.getDay() === 0 || dateObj.getDay() === 6;\n\n  let activeSession = session1;\n\n  if (activeSession === '') {\n    activeSession = isWeekend ? 'OFF' : 'A';\n  } else if (activeSession === 'A' && isWeekend) {\n    activeSession = 'OFF';\n  }\n\n  let lateFlag;\n  let checkIn  = 'MISSING';\n  let checkOut = 'MISSING';\n\n  if (activeSession === 'OFF') {\n    lateFlag = 'OFF';\n  } else if (activeSession === 'A') {\n    lateFlag = assignLeaveType(currentEmployee.employeeId, dateStr);\n  } else if (activeSession === 'LC') {\n    const checkInTime = extractTime(inTime);\n    if (checkInTime === 'MISSING') continue;\n    checkIn  = checkInTime;\n    checkOut = extractTime(outTime);\n    lateFlag = 'YES';\n  } else {\n    const checkInTime = extractTime(inTime);\n    if (checkInTime === 'MISSING') continue;\n    checkIn  = checkInTime;\n    checkOut = extractTime(outTime);\n    const [hour, minute] = checkIn.split(':').map(Number);\n    lateFlag = (!isNaN(hour) && (hour > 11 || (hour === 11 && minute > 0))) ? 'YES' : 'NO';\n  }\n\n  results.push({\n    json: {\n      employeeId:    currentEmployee.employeeId,\n      name:          currentEmployee.name,\n      department:    currentEmployee.department,\n      designation:   currentEmployee.designation,\n      managerName:   currentEmployee.managerName,\n      managerNo:     currentEmployee.managerNo,\n      dateOfJoining: currentEmployee.dateOfJoining,\n      date:          dateStr,\n      checkIn:       checkIn,\n      checkOut:      checkOut,\n      lateFlag:      lateFlag\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        -560
+      ],
+      "id": "0b0a7d44-2625-4ee6-a98e-99e98ee2697c",
+      "name": "Transform Attendance Data"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO daily_records (\n    employee_id, \n    name, \n    department,\n    designation,\n    manager_name,\n    manager_no,\n    date_of_joining,\n    date, \n    check_in, \n    check_out, \n    late_flag\n)\nVALUES (\n    '{{ $json.employeeId }}', \n    '{{ $json.name }}', \n    '{{ $json.department }}', \n    '{{ $json.designation }}',\n    '{{ $json.managerName }}',\n    '{{ $json.managerNo }}',\n    '{{ $json.dateOfJoining }}',\n    '{{ $json.date }}', \n    '{{ $json.checkIn }}', \n    '{{ $json.checkOut }}', \n    '{{ $json.lateFlag }}'\n)\nON CONFLICT (employee_id, date) DO UPDATE \nSET \n    check_in = EXCLUDED.check_in,\n    check_out = EXCLUDED.check_out,\n    late_flag = EXCLUDED.late_flag,\n    department = EXCLUDED.department,\n    designation = EXCLUDED.designation,\n    manager_name = EXCLUDED.manager_name,\n    manager_no = EXCLUDED.manager_no,\n    date_of_joining = EXCLUDED.date_of_joining\nRETURNING *;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -224,
+        -560
+      ],
+      "id": "37d27e5f-c8bd-4132-9dd7-21e7df6eed89",
+      "name": "Save Daily Records",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\n// Filter for late employees (checking both camelCase and snake_case just to be safe)\nconst lateItems = items.filter(item => \n  item.json.lateFlag === 'YES' || item.json.late_flag === 'YES'\n);\n\nconst results = [];\n\nfor (const item of lateItems) {\n  // Grab the date\n  const dateStr = item.json.date || '';\n\n  results.push({\n    json: {\n      // Safely map keys regardless of how the previous node output them\n      employeeId: item.json.employeeId || item.json.employee_id,\n      name: item.json.name,\n      department: item.json.department, \n      designation: item.json.designation,\n      managerName: item.json.managerName || item.json.manager_name,\n      managerNo: item.json.managerNo || item.json.manager_no,\n      dateOfJoining: item.json.dateOfJoining || item.json.date_of_joining,\n      date: dateStr,\n      checkIn: item.json.checkIn || item.json.check_in,\n      checkOut: item.json.checkOut || item.json.check_out,\n      lateFlag: item.json.lateFlag || item.json.late_flag,\n      month: dateStr.substring(0, 7) // Extracts YYYY-MM\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        -560
+      ],
+      "id": "172f85e1-6d51-4c36-afef-3fb7d0a75780",
+      "name": "Filter Late Employees",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst counter = {};\n\nfor (const item of items) {\n  // 1. Destructure ALL the profile data along with the core logic fields\n  const { \n    employeeId, \n    name, \n    department, \n    designation, \n    managerName, \n    managerNo, \n    dateOfJoining, \n    month, \n    date \n  } = item.json;\n  \n  const key = `${employeeId}_${month}`;\n\n  // 2. If this is the first late day we've seen for this employee this month, set up their profile\n  if (!counter[key]) {\n    counter[key] = {\n      employeeId,\n      name,\n      department,\n      designation,\n      managerName,\n      managerNo,\n      dateOfJoining,\n      monthYear: month,\n      monthlyLateCount: 0,\n      lastWarningDate: ''\n    };\n  }\n  \n  // 3. Increment the late count and update the most recent late date\n  counter[key].monthlyLateCount += 1;\n  counter[key].lastWarningDate = date || item.json.date;\n}\n\n// 4. Map the aggregated data back into n8n's expected JSON format\nconst results = Object.values(counter).map(emp => ({\n  json: {\n    employeeId: emp.employeeId,\n    name: emp.name,\n    department: emp.department,\n    designation: emp.designation,\n    managerName: emp.managerName,\n    managerNo: emp.managerNo,\n    dateOfJoining: emp.dateOfJoining,\n    monthlyLateCount: emp.monthlyLateCount,\n    lastWarningDate: emp.lastWarningDate,\n    monthYear: emp.monthYear,\n    strikeLevel: emp.monthlyLateCount >= 3 ? 3 : emp.monthlyLateCount\n  }\n}));\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        -560
+      ],
+      "id": "a7b0a398-e602-4403-8e66-17d60bbb4060",
+      "name": "Count Late Per Employee"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO strike_counter (\n    employee_id,\n    name,\n    department,\n    designation,\n    manager_name,\n    manager_no,\n    date_of_joining,\n    month_year,\n    monthly_late_count,\n    last_warning_date,\n    strike_level\n)\nVALUES (\n    '{{ $json.employeeId }}',\n    '{{ $json.name }}',\n    '{{ $json.department }}',\n    '{{ $json.designation }}',\n    '{{ $json.managerName }}',\n    '{{ $json.managerNo }}',\n    '{{ $json.dateOfJoining }}',\n    '{{ $json.monthYear }}',\n    {{ $json.monthlyLateCount }},\n    '{{ $json.lastWarningDate }}',\n    {{ $json.strikeLevel }}\n)\nON CONFLICT (employee_id, month_year) DO UPDATE\nSET\n    monthly_late_count = EXCLUDED.monthly_late_count,\n    last_warning_date = EXCLUDED.last_warning_date,\n    strike_level = EXCLUDED.strike_level,\n    department = EXCLUDED.department,\n    designation = EXCLUDED.designation,\n    manager_name = EXCLUDED.manager_name,\n    manager_no = EXCLUDED.manager_no,\n    date_of_joining = EXCLUDED.date_of_joining\nRETURNING *;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        448,
+        -560
+      ],
+      "id": "4259b008-7178-4d9b-84c7-f0960a1d56b9",
+      "name": "Save Strike Counter",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "fb495ea6-72d2-468b-b002-957cac461d88",
+              "leftValue": "={{ Number($json.monthly_late_count) }}",
+              "rightValue": 3,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        672,
+        -656
+      ],
+      "id": "2064833b-8e3e-482c-92b1-9556dbb02aac",
+      "name": "3rd Strike Check"
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "e02475102953ae21fe1cd8f56cab7e67d1c69c5cc8eb15c4cf7121dadfe2e18a@group.calendar.google.com",
+          "mode": "list",
+          "cachedResultName": "Attendance System"
+        },
+        "start": "={{ $('Stagger Meeting Times').item.json.meeting_start }}",
+        "end": "={{ $('Stagger Meeting Times').item.json.meeting_end }}",
+        "additionalFields": {
+          "description": "=3rd strike warning meeting for {{ $('Stagger Meeting Times').item.json.name }} ({{ $('Stagger Meeting Times').item.json.employee_id }}). Total late days this month: {{ $('Stagger Meeting Times').item.json.monthly_late_count }}",
+          "summary": "=Attendance Warning Meeting - {{ $('Stagger Meeting Times').item.json.name }}"
+        }
+      },
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1184,
+        -752
+      ],
+      "id": "45eceb33-5612-4831-b458-45ee9da2eaef",
+      "name": "Schedule Warning Meeting",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "LyWH9WP9rekuvjqa",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "llama3.2:3b",
+          "mode": "list",
+          "cachedResultName": "llama3.2:3b"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "==You are an HR assistant. Fill in the blanks in the template below using the employee details.\\nDo NOT change the structure. ONLY replace the [PLACEHOLDERS] with appropriate content.\\nReturn ONLY the completed email body, nothing else.\\n\\n---\\n\\nDear {{ $('Stagger Meeting Times').item.json.name }},\\n\\nThis is your 3rd and final warning regarding your attendance for {{ $('Stagger Meeting Times').item.json.month_year }}. Our records confirm that you have arrived late on {{ $('Stagger Meeting Times').item.json.monthly_late_count }} occasions this month, most recently on {{ $('Stagger Meeting Times').item.json.last_warning_date }}.\\n\\n[WRITE 2 sentences explaining the seriousness of this final warning in a firm and professional tone]\\n\\nA mandatory meeting has been scheduled for you — please check the calendar invite for the exact time: {{ $json.htmlLink }}\\n\\n[WRITE 1 sentence stating that further action will be taken if punctuality does not improve immediately]\\n\\nBest regards,\\nHR Department\\nGrowify Digital LLP"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.ollama",
+      "typeVersion": 1,
+      "position": [
+        1472,
+        -656
+      ],
+      "id": "3e2c646a-58fc-47e9-b302-257c72257b05",
+      "name": "Draft 3rd Strike Email",
+      "credentials": {
+        "ollamaApi": {
+          "id": "E654q1G75D7HVMYV",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "llama3.2:3b",
+          "mode": "list",
+          "cachedResultName": "llama3.2:3b"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are an HR assistant. Fill in the blanks in the template below using the employee details.\nDo NOT change the structure. ONLY replace the [PLACEHOLDERS] with appropriate content.\nReturn ONLY the completed email body, nothing else.\n\n---\n\nDear {{ $('Count Late Per Employee').item.json.name }},\n\nWe hope this message finds you well.\n\nThis is a formal warning regarding your attendance for {{ $('Count Late Per Employee').item.json.monthYear }}. Our records indicate that you have arrived late on {{ $('Count Late Per Employee').item.json.monthlyLateCount }} occasion(s) this month, most recently on {{ $('Count Late Per Employee').item.json.lastWarningDate }}.\n\n[WRITE 2 sentences reminding the employee about the company punctuality policy in a firm but respectful tone]\n\n[WRITE 1 sentence offering support if they are facing any personal or professional challenges]\n\nPlease note that continued tardiness will result in escalating disciplinary action.\n\nBest regards,\nHR Department\nGrowify Digital LLP"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.ollama",
+      "typeVersion": 1,
+      "position": [
+        1472,
+        -464
+      ],
+      "id": "3a1541c8-a26f-4cbc-acfb-ec2bbad1d0c5",
+      "name": "Draft Warning Email",
+      "credentials": {
+        "ollamaApi": {
+          "id": "E654q1G75D7HVMYV",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1824,
+        -560
+      ],
+      "id": "b3e05a7c-ff0b-4bef-9e35-701d082e9bf4",
+      "name": "Merge Email Branches"
+    },
+    {
+      "parameters": {
+        "sendTo": "lowkeyypal@gmail.com",
+        "subject": "=Attendance Warning - {{ $('Count Late Per Employee').item.json.name }} [ID: {{ $('Count Late Per Employee').item.json.employeeId }}]",
+        "message": "={{ $json.content.replace(/\\n/g, '<br>') }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2048,
+        -560
+      ],
+      "id": "eeebbaf9-4d91-4e77-9583-40beaf763f11",
+      "name": "Send Warning Email",
+      "webhookId": "ccc1e0de-0c1b-4318-ad7c-22d4676fb771",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "h1e8oT4tpWyHflaU",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"status\": \"success\",\n  \"message\": \"Attendance processed successfully\",\n  \"timestamp\": \"{{ $now.toISO() }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2496,
+        -560
+      ],
+      "id": "c46931eb-2d1e-4c24-9730-307b1416caad",
+      "name": "Send Success Response"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nif (!items || items.length === 0) {\n  return [{ json: { skip: true } }];\n}\n\n// Group rows by employee_id\nconst grouped = {};\n\nfor (const item of items) {\n  const id = item.json.employee_id;\n  if (!grouped[id]) {\n    grouped[id] = {\n      employee_id: id,\n      name: item.json.name,\n      month_year: item.json.month_year,\n      monthly_late_count: item.json.monthly_late_count,\n      rows: []\n    };\n  }\n  grouped[id].rows.push(item.json);\n}\n\n// Return one item per employee with their full history\nreturn Object.values(grouped).map(emp => ({\n  json: {\n    employee_id: emp.employee_id,\n    name: emp.name,\n    month_year: emp.month_year,\n    monthly_late_count: emp.monthly_late_count,\n    historyText: emp.rows.map(r => \n      `${r.month_year}: ${r.monthly_late_count} late days`\n    ).join('\\n')\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -272
+      ],
+      "id": "246f07c6-a25f-4152-995d-c8f6175c435b",
+      "name": "Format History Data"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE strike_counter \nSET behaviour_analysis = '{{ $json.content.replace(/'/g, \"''\") }}'\nWHERE employee_id = '{{ $('Format History Data').item.json.employee_id }}'\nAND month_year = '{{ $('Format History Data').item.json.month_year }}';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1536,
+        -272
+      ],
+      "id": "07f3c569-e1b4-4621-90d5-ff8ee5fc8160",
+      "name": "Save Behaviour Analysis",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst dateSlots = {};\n\nfunction getNextSlot(date) {\n  if (dateSlots[date] === undefined) {\n    dateSlots[date] = 9;\n  }\n\n  // If past 4pm, roll to next day\n  if (dateSlots[date] > 16) {\n    const next = new Date(date);\n    next.setDate(next.getDate() + 1);\n    date = next.toISOString().split('T')[0];\n    dateSlots[date] = 9;\n  }\n\n  const hour = dateSlots[date];\n  dateSlots[date]++;\n\n  return {\n    date,\n    start: `${date}T${String(hour).padStart(2,'0')}:00:00+05:30`,\n    end: `${date}T${String(hour + 1).padStart(2,'0')}:00:00+05:30`\n  };\n}\n\nconst results = items.map(item => {\n  const date = item.json.last_warning_date.split('T')[0];\n  const slot = getNextSlot(date);\n\n  return {\n    json: {\n      ...item.json,\n      meeting_start: slot.start,\n      meeting_end: slot.end\n    }\n  };\n});\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -752
+      ],
+      "id": "072b5373-2e1a-4940-94ef-bc12db1b2954",
+      "name": "Stagger Meeting Times"
+    },
+    {
+      "parameters": {
+        "jsCode": "const employees = $('Count Late Per Employee').all();\n// Add this line to sort by Strike Level (High to Low), then Late Days (High to Low)\nemployees.sort((a, b) => {\n  if (b.json.strikeLevel !== a.json.strikeLevel) {\n    return b.json.strikeLevel - a.json.strikeLevel; \n  }\n  return b.json.monthlyLateCount - a.json.monthlyLateCount;\n});\n\nlet lines = [];\n// ... (the rest of the code stays exactly the same)\n\n// Add the top message here\nlines.push(\"*Monthly Attendance Warning Report*\");\nlines.push(`Here is the summary of the ${employees.length} employees who received warnings this month:`);\nlines.push(\"-----------------------------------------------------------------------------------------------------\");\n\nemployees.forEach(emp => {\n  const d = emp.json;\n  const strike = d.strikeLevel;\n  \n  // Aggressively collapse all hidden spaces, tabs, and carriage returns into a normal space\n  const name = String(d.name || \"\").replace(/\\s+/g, \" \").trim();\n  const id = String(d.employeeId || \"\").replace(/\\s+/g, \" \").trim();\n  \n  const meetingNote = strike >= 3 ? \"Meeting invite & warning email sent\" : \"Warning email sent\";\n  \n  // Push the clean string to our list\n  lines.push(`*${name}* (${id}) | Late Days: ${d.monthlyLateCount} | Strike: ${strike} — ${meetingNote}`);\n});\n\n// Bind everything together with exactly ONE standard line break\nreturn [{ json: { slack_text: lines.join('\\n') } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2720,
+        -560
+      ],
+      "id": "f298d8ef-c24b-498e-a547-903e81d9268f",
+      "name": "Slack Code Node"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n  {\n    \"channel\": \"#attendance-warnings\",\n    \"text\": $json.slack_text\n  }\n}}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2944,
+        -560
+      ],
+      "id": "13c6ac33-7f7f-47c3-a904-c1cead0198e5",
+      "name": "Send Message Slack",
+      "credentials": {
+        "slackApi": {
+          "id": "kHQWBTWJc0HRY0pX",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, description, action_by)\nVALUES (\n  'RECORDS_CLEARED',\n  'Previous month records cleared from database',\n  'system'\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -448,
+        -752
+      ],
+      "id": "85952ad5-4001-4447-87c2-08e3e3c72ca0",
+      "name": "Log Records Cleared",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, description, employee_id, employee_name, action_by)\nVALUES (\n  'MEETING_SCHEDULED',\n  'Warning meeting scheduled in Google Calendar',\n  '{{ $('Stagger Meeting Times').item.json.employee_id }}',\n  '{{ $('Stagger Meeting Times').item.json.name }}',\n  'system'\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1536,
+        -848
+      ],
+      "id": "3d17a0b7-3112-4946-af4e-f9cea56b2332",
+      "name": "Log Meeting Scheduled",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, description)\nVALUES (\n  'ANALYSIS_SAVED',\n  'AI behaviour analysis saved to database'\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1824,
+        -272
+      ],
+      "id": "811f915b-b9ac-4a8e-8aea-c3d9ef77ab24",
+      "name": "Log Analysis Saved",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, description, employee_id, employee_name, action_by)\nVALUES (\n  'WARNING_ISSUED',\n  'Warning email sent for late attendance',\n  '{{ $('Count Late Per Employee').item.json.employeeId }}',\n  '{{ $('Count Late Per Employee').item.json.name }}',\n  'system'\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2272,
+        -560
+      ],
+      "id": "89f0fedd-b01c-4f1e-946d-55e354b99af0",
+      "name": "Log Warning Issued",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, description, action_by)\nVALUES (\n  'SLACK_NOTIFIED',\n  'Monthly attendance warning summary posted to Slack #attendance-warnings',\n  'system'\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3168,
+        -560
+      ],
+      "id": "3d11ae25-1ba6-4c2d-aba2-90306c17e809",
+      "name": "Log Slack Notified",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst SL_QUOTA = 12;\nconst CL_QUOTA = 12;\nconst EL_QUOTA = 21;\n\nfunction excelDateToString(val) {\n  if (!val) return '';\n  if (typeof val === 'string' && val.includes('-')) return val.trim();\n  const serial = Number(val);\n  if (isNaN(serial)) return String(val).trim();\n  const date = new Date((serial - 25569) * 86400 * 1000);\n  return date.toISOString().split('T')[0];\n}\n\n// SAME hash as Transform Attendance Data node: empId + date → SL/CL/EL\n// This guarantees leave_balances totals = sum of what's in daily_records\nfunction assignLeaveType(empId, dateStr) {\n  const seed = [...(empId + dateStr)].reduce((acc, c) => acc + c.charCodeAt(0), 0);\n  return ['SL', 'CL', 'EL'][seed % 3];\n}\n\nlet colMap = {\n  dateOfJoining: '__EMPTY_1',\n  managerNo: '__EMPTY_2',\n  managerName: '__EMPTY_3',\n  department: '__EMPTY_5',\n  designation: '__EMPTY_6'\n};\n\nlet currentEmployee = null;\nconst employeeMap = {};\n\nfor (const item of items) {\n  const row = item.json;\n  const firstCol = row['Growify Digital LLP'];\n  const firstStr = String(firstCol || '').trim();\n\n  if (firstStr.toLowerCase().includes('employee') && firstStr.toLowerCase().includes('no')) {\n    for (const key of Object.keys(row)) {\n      const val = String(row[key] || '').trim().toLowerCase();\n      if (val.includes('date of joining')) colMap.dateOfJoining = key;\n      if (val.includes('manager no'))      colMap.managerNo     = key;\n      if (val.includes('manager name'))    colMap.managerName   = key;\n      if (val === 'department')            colMap.department    = key;\n      if (val === 'designation')           colMap.designation   = key;\n    }\n    continue;\n  }\n\n  if (firstStr.match(/^GD\\d+/)) {\n    currentEmployee = {\n      employeeId:    firstStr,\n      name:          String(row['__EMPTY'] || '').trim(),\n      department:    String(row[colMap.department]   || 'Unknown').trim(),\n      designation:   String(row[colMap.designation]  || 'Unknown').trim(),\n      dateOfJoining: excelDateToString(row[colMap.dateOfJoining]),\n      managerName:   String(row[colMap.managerName]  || 'Unknown').trim(),\n      present_days: 0,\n      absent_days:  0,\n      sl_taken:     0,\n      cl_taken:     0,\n      el_taken:     0,\n      lc_days:      0,\n      month_year:   '',\n    };\n    employeeMap[firstStr] = currentEmployee;\n    continue;\n  }\n\n  if (!currentEmployee) continue;\n  if (!firstCol || isNaN(Number(firstCol))) continue;\n\n  const session1 = String(row['__EMPTY_1'] || '').trim().toUpperCase();\n  const dateRaw  = row['__EMPTY'];\n\n  if (!currentEmployee.month_year && dateRaw) {\n    const d = excelDateToString(dateRaw);\n    if (d) {\n      const [yr, mo] = d.split('-');\n      const monthName = new Date(`${yr}-${mo}-01`).toLocaleString('en-US', { month: 'long' });\n      currentEmployee.month_year = `${monthName} ${yr}`;\n    }\n  }\n\n  const dStr = excelDateToString(dateRaw);\n  let activeSession = session1;\n  \n  if (dStr) {\n    const dateObj = new Date(dStr);\n    const isWeekend = dateObj.getDay() === 0 || dateObj.getDay() === 6;\n    if (activeSession === '') {\n      activeSession = isWeekend ? 'OFF' : 'A';\n    } else if (activeSession === 'A' && isWeekend) {\n      activeSession = 'OFF';\n    }\n  }\n\n  switch (activeSession) {\n    case 'P':   currentEmployee.present_days++; break;\n    case 'LC':  currentEmployee.lc_days++;      break;\n    case 'A': {\n      // Use the SAME deterministic hash as the Transform node\n      // so leave_balances sl/cl/el totals match daily_records exactly\n      const leaveType = assignLeaveType(currentEmployee.employeeId, dStr);\n      currentEmployee.absent_days++;\n      if (leaveType === 'SL')      currentEmployee.sl_taken++;\n      else if (leaveType === 'CL') currentEmployee.cl_taken++;\n      else                         currentEmployee.el_taken++;\n      break;\n    }\n    case 'OFF': break;\n    default:    break;\n  }\n}\n\nconst results = [];\n\nfor (const [empId, emp] of Object.entries(employeeMap)) {\n  results.push({\n    json: {\n      employee_id:   emp.employeeId,\n      employee_name: emp.name,\n      department:    emp.department,\n      designation:   emp.designation,\n      month_year:    emp.month_year,\n      present_days:  emp.present_days,\n      absent_days:   emp.absent_days,\n      lc_days:       emp.lc_days,\n      sl_taken:      emp.sl_taken,\n      cl_taken:      emp.cl_taken,\n      el_taken:      emp.el_taken,\n      sl_left:       Math.max(0, SL_QUOTA - emp.sl_taken),\n      cl_left:       Math.max(0, CL_QUOTA - emp.cl_taken),\n      el_left:       Math.max(0, EL_QUOTA - emp.el_taken),\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        -368
+      ],
+      "id": "a7a787a1-7f9d-4dca-bc5f-1de0c28cc808",
+      "name": "Calculate Leave Balances"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "leave_balances",
+          "mode": "list",
+          "cachedResultName": "leave_balances"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "sl_taken": 0,
+            "cl_taken": 0,
+            "el_taken": 0,
+            "sl_left": 0,
+            "cl_left": 0,
+            "el_left": 0,
+            "absent_days": 0,
+            "lc_days": 0,
+            "present_days": 0
+          },
+          "matchingColumns": [
+            "employee_id"
+          ],
+          "schema": [
+            {
+              "id": "employee_id",
+              "displayName": "employee_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "employee_name",
+              "displayName": "employee_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "sl_taken",
+              "displayName": "sl_taken",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "cl_taken",
+              "displayName": "cl_taken",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "el_taken",
+              "displayName": "el_taken",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "sl_left",
+              "displayName": "sl_left",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "cl_left",
+              "displayName": "cl_left",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "el_left",
+              "displayName": "el_left",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "absent_days",
+              "displayName": "absent_days",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "lc_days",
+              "displayName": "lc_days",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "present_days",
+              "displayName": "present_days",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "department",
+              "displayName": "department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "designation",
+              "displayName": "designation",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "month_year",
+              "displayName": "month_year",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -224,
+        -368
+      ],
+      "id": "51d32c5b-a7a1-48ec-b4a0-56effd10432a",
+      "name": "Save Leave Balances",
+      "credentials": {
+        "postgres": {
+          "id": "xbMi75VZQ7Ws5GYS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "e02475102953ae21fe1cd8f56cab7e67d1c69c5cc8eb15c4cf7121dadfe2e18a@group.calendar.google.com",
+          "mode": "list",
+          "cachedResultName": "Attendance System"
+        },
+        "returnAll": true,
+        "timeMin": "={{ $now.minus({ months: 2 }).startOf('month') }}",
+        "timeMax": "={{ $now.startOf('month') }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        -224,
+        -752
+      ],
+      "id": "75c7d1e9-0860-4755-a962-cf5f73a69882",
+      "name": "Get calendar events",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "LyWH9WP9rekuvjqa",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "e02475102953ae21fe1cd8f56cab7e67d1c69c5cc8eb15c4cf7121dadfe2e18a@group.calendar.google.com",
+          "mode": "list",
+          "cachedResultName": "Attendance System"
+        },
+        "eventId": "={{ $json.id }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        -752
+      ],
+      "id": "f9cd3087-00c0-4738-94ba-c4ce325a18ea",
+      "name": "Delete calendar events",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "LyWH9WP9rekuvjqa",
+          "name": "Google Calendar account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Fetch Employee History": {
+      "main": [
+        [
+          {
+            "node": "Format History Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyse Behaviour": {
+      "main": [
+        [
+          {
+            "node": "Save Behaviour Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Receive Attendance File": {
+      "main": [
+        [
+          {
+            "node": "Parse XLSX",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Clear Old Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Old Records": {
+      "main": [
+        [
+          {
+            "node": "Log Records Cleared",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse XLSX": {
+      "main": [
+        [
+          {
+            "node": "Transform Attendance Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Calculate Leave Balances",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transform Attendance Data": {
+      "main": [
+        [
+          {
+            "node": "Save Daily Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Daily Records": {
+      "main": [
+        [
+          {
+            "node": "Filter Late Employees",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Late Employees": {
+      "main": [
+        [
+          {
+            "node": "Count Late Per Employee",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Count Late Per Employee": {
+      "main": [
+        [
+          {
+            "node": "Save Strike Counter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Strike Counter": {
+      "main": [
+        [
+          {
+            "node": "3rd Strike Check",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Employee History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3rd Strike Check": {
+      "main": [
+        [
+          {
+            "node": "Stagger Meeting Times",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Draft Warning Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Warning Meeting": {
+      "main": [
+        [
+          {
+            "node": "Draft 3rd Strike Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Meeting Scheduled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft 3rd Strike Email": {
+      "main": [
+        [
+          {
+            "node": "Merge Email Branches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Warning Email": {
+      "main": [
+        [
+          {
+            "node": "Merge Email Branches",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Email Branches": {
+      "main": [
+        [
+          {
+            "node": "Send Warning Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Warning Email": {
+      "main": [
+        [
+          {
+            "node": "Log Warning Issued",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format History Data": {
+      "main": [
+        [
+          {
+            "node": "Analyse Behaviour",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stagger Meeting Times": {
+      "main": [
+        [
+          {
+            "node": "Schedule Warning Meeting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Code Node": {
+      "main": [
+        [
+          {
+            "node": "Send Message Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Behaviour Analysis": {
+      "main": [
+        [
+          {
+            "node": "Log Analysis Saved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Records Cleared": {
+      "main": [
+        [
+          {
+            "node": "Get calendar events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Success Response": {
+      "main": [
+        [
+          {
+            "node": "Slack Code Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Warning Issued": {
+      "main": [
+        [
+          {
+            "node": "Send Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Message Slack": {
+      "main": [
+        [
+          {
+            "node": "Log Slack Notified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Leave Balances": {
+      "main": [
+        [
+          {
+            "node": "Save Leave Balances",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get calendar events": {
+      "main": [
+        [
+          {
+            "node": "Delete calendar events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "3740fe2d-bbac-4494-81f1-36692db46dc0",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "4acd8bf51771f6f4fa0ffda7ef1f0835417d4e00e0e146418b542b6b81dbbc05"
+  },
+  "id": "zHJanHC7KIkBqwvi",
+  "tags": []
+}
