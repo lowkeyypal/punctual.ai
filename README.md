@@ -115,11 +115,16 @@ punctual.ai/
    npm install
    ```
 
-3. **Configure Environment**
-   Create a `.env` file and add your Supabase credentials.
+3. **Configure Environment (Dashboard)**
+   Create a `.env` file in the root directory and add your Supabase URL and Anon Key.
 
-4. **Import n8n Workflows**
-   Import the `.json` files in the root directory into your n8n instance and configure the Postgres/Gmail/Slack credentials.
+4. **Configure n8n Credentials**
+   Import the `.json` files from the root directory into your n8n instance. You will need to set up the following credentials within n8n:
+   - **Gmail API** (for warning emails)
+   - **Google Calendar API** (for meeting scheduling)
+   - **Slack API** (for team notifications)
+   - **Postgres Account** (connect using your Supabase database host/URL)
+   - **Ollama** (connect to your local AI instance)
 
 5. **Run the application**
    ```bash
@@ -155,16 +160,15 @@ punctual.ai/
   <img src="public/images/sc7.png" width="48%"> <img src="public/images/sc8.png" width="48%">
 </div>
 
+
 ---
 
-## Browser Compatibility
+## 🚀 Roadmap
 
-| Browser | Support      |
-| ------- | ------------ |
-| Chrome  | Recommended  |
-| Edge    | Full support |
-| Firefox | Full support |
-| Safari  | Full support |
+- [ ] **Interactive Slack Bot** — Automate escalating strike-level warnings (1st nudge to 3rd manager escalation) directly via n8n triggers.
+- [ ] **Predictive "Flight Risk" Analytics** — Visualize and calculate retention insights from backend risk data stored in Supabase.
+- [ ] **AI Executive Summary Widget** — AI-powered dashboard summaries with natural language search for detailed employee health history.
+- [ ] **Automated Excuse Validation** — Two-way communication for real-time excuse verification and processing.
 
 ---
 
@@ -178,6 +182,12 @@ punctual.ai/
 **AI analysis slow?**
 
 - Ensure Ollama is running and the `llama3.2:3b` model is downloaded locally (`ollama pull llama3.2`).
+
+---
+
+## Contributors
+
+- **Devyanshu Kataria** ([@Devyanshu-Kataria](https://github.com/Devyanshu-Kataria)) — Frontend Development & UI/UX Enhancements.
 
 ---
 
